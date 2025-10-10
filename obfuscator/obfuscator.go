@@ -463,7 +463,18 @@ func (c *Obfuscator) randomString(lenStr int) (result string) {
 
 func (c *Obfuscator) obfuscateString(str string, key int32) string {
 	var decrypted []rune
-	for _, c := range strings.ReplaceAll(str, "|", " ") {
+
+	// если | первый в строке 1С его заменит на перенос строк, убераем такой
+	lines := strings.Split(str, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(trimmed, "|") {
+			lines[i] = line[:len(line)-len(trimmed)] + " " + trimmed[1:]
+		}
+	}
+	str = strings.Join(lines, "\n")
+
+	for _, c := range str {
 		decrypted = append(decrypted, c^key)
 	}
 
