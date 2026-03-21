@@ -1089,6 +1089,36 @@ func TestObfuscate2(t *testing.T) {
 	}
 }
 
+func TestObfuscate3(t *testing.T) {
+	code := `&НаСервереБезКонтекста
+				&НаКлиенте
+				&ИзменениеИКонтроль("аваав")
+							Функция Команда1НаСервере()
+				
+								Запрос = Новый Запрос;
+				  Запрос.Текст = "ВЫБРАТЬ
+								 |  ""В работе"" КАК Статус"; 
+				  Выборка = Запрос.Выполнить().Выбрать();
+				  Если Выборка.Следующий() Тогда
+					Сообщить(Выборка.Статус);
+				  КонецЕсли;
+			 КонецФункции`
+
+	obf := NewObfuscatory(context.Background(), Config{
+		RepExpByTernary:  true,
+		RepLoopByGoto:    true,
+		RepExpByEval:     true,
+		HideString:       true,
+		ChangeConditions: true,
+		AppendGarbage:    true,
+		LineBreaks:       true,
+	})
+
+	obCode, err := obf.Obfuscate(code)
+	assert.NoError(t, err)
+	fmt.Println(obCode)
+}
+
 func TestObfuscateExp(t *testing.T) {
 
 	code := `&НаКлиенте

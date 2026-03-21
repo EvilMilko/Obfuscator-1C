@@ -13,6 +13,7 @@ import (
 	"github.com/LazarenkoA/1c-language-parser/ast"
 	"github.com/knetic/govaluate"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 )
 
 type Config struct {
@@ -39,6 +40,9 @@ type Config struct {
 
 	// CallStackHell прятать выражения за большим количеством фейковых функций
 	CallStackHell bool
+
+	// LineBreaks false - результат будет в одну строку
+	LineBreaks bool
 }
 
 type Obfuscator struct {
@@ -89,7 +93,7 @@ func (c *Obfuscator) Obfuscate(code string) (string, error) {
 		c.walkStep(root, parentStm, stm)
 	})
 
-	result := c.a.Print(ast.PrintConf{OneLine: true, Margin: 1})
+	result := c.a.Print(ast.PrintConf{OneLine: !c.conf.LineBreaks, Margin: 1})
 	// result = strings.ToLower(result) // нельзя так делать, все поломает
 	return result, nil
 }
@@ -107,7 +111,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 	switch v := (*item).(type) {
 	case string:
 		if c.conf.HideString {
-			*item = c.createObfuscateStringStatement(currentFP.Directive, v, int32(key))
+			*item = c.createObfuscateStringStatement(currentFP.Directives, v, int32(key))
 		}
 	case *ast.IfStatement:
 		c.walkStep(currentFP, item, &v.Expression)
@@ -131,7 +135,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 				c.walkStep(currentFP, item, &casted)
 			case string:
 				if c.conf.HideString {
-					v.Param.Statements[i] = c.createObfuscateStringStatement(currentFP.Directive, casted, int32(key))
+					v.Param.Statements[i] = c.createObfuscateStringStatement(currentFP.Directives, casted, int32(key))
 				}
 			case ast.VarStatement:
 				if c.conf.RepExpByTernary {
@@ -149,13 +153,13 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 			*item = ast.MethodStatement{
 				Name: "Выполнить",
 				Param: ast.ExprStatements{
-					Statements: ast.Statements{c.createObfuscateStringStatement(currentFP.Directive, str, int32(key))},
+					Statements: ast.Statements{c.createObfuscateStringStatement(currentFP.Directives, str, int32(key))},
 				},
 			}
 		}
 	case *ast.ReturnStatement:
 		if str, ok := v.Param.(string); ok && c.conf.HideString {
-			v.Param = c.createObfuscateStringStatement(currentFP.Directive, str, int32(key))
+			v.Param = c.createObfuscateStringStatement(currentFP.Directives, str, int32(key))
 		}
 	case *ast.ExpStatement:
 		c.obfuscateExpStatement(currentFP, (*interface{})(item))
@@ -171,7 +175,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 				v.Right = ast.MethodStatement{
 					Name: "Вычислить",
 					Param: ast.ExprStatements{Statements: ast.Statements{ast.MethodStatement{
-						Name:  c.decodeStringFunc(currentFP.Directive),
+						Name:  c.decodeStringFunc(currentFP.Directives),
 						Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, int32(key)), c.hideValue(key, 4)}},
 					}}},
 				}
@@ -190,7 +194,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 				Name: ast.IF(c.isMethod(parent) || c.isExp(parent), "Вычислить", "Выполнить"),
 				Param: ast.ExprStatements{Statements: ast.Statements{
 					ast.MethodStatement{
-						Name:  c.decodeStringFunc(currentFP.Directive),
+						Name:  c.decodeStringFunc(currentFP.Directives),
 						Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, int32(key)), c.hideValue(key, 4)}},
 					},
 				}},
@@ -211,7 +215,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 		c.walkStep(currentFP, item, ptr(ast.Statement(v.Expr)))
 
 		if c.conf.CallStackHell {
-			c.hideBehindCallStack(currentFP.Directive, v.Expr, int(random(3, 7)))
+			c.hideBehindCallStack(currentFP.Directives, v.Expr, int(random(3, 7)))
 		}
 	case ast.NewObjectStatement:
 		c.walkStep(currentFP, item, ptr(ast.Statement(v.Param)))
@@ -242,41 +246,52 @@ func (c *Obfuscator) obfuscateExpStatement(currentPF *ast.FunctionOrProcedure, p
 		}
 	case string:
 		if c.conf.HideString {
-			*part = c.createObfuscateStringStatement(currentPF.Directive, r, int32(key))
+			*part = c.createObfuscateStringStatement(currentPF.Directives, r, int32(key))
 		}
 		return
 	case ast.ReturnStatement:
 		if str, ok := r.Param.(string); ok && c.conf.HideString {
 			r.Param = ast.MethodStatement{
-				Name:  c.decodeStringFunc(currentPF.Directive),
+				Name:  c.decodeStringFunc(currentPF.Directives),
 				Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, int32(key)), c.hideValue(key, 4)}},
 			}
 		}
 	case ast.IParams:
 		for i, param := range r.Params() {
 			if str, ok := param.(string); ok && c.conf.HideString {
-				r.Params()[i] = c.createObfuscateStringStatement(currentPF.Directive, str, int32(key))
+				r.Params()[i] = c.createObfuscateStringStatement(currentPF.Directives, str, int32(key))
 			}
 		}
 	}
 }
 
-func (c *Obfuscator) createObfuscateStringStatement(directive string, str string, key int32) ast.MethodStatement {
+func (c *Obfuscator) createObfuscateStringStatement(directive []*ast.DirectiveStatement, str string, key int32) ast.MethodStatement {
 	return ast.MethodStatement{
 		Name:  c.decodeStringFunc(directive),
 		Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, key), c.hideValue(key, 4)}},
 	}
 }
 
-func (c *Obfuscator) decodeStringFunc(directive string) string {
-	if name, ok := c.decodeStringFuncName[directive]; ok {
+func (c *Obfuscator) decodeStringFunc(directives []*ast.DirectiveStatement) string {
+	key := strings.Join(directiveStatementToString(directives), "")
+	if name, ok := c.decodeStringFuncName[key]; ok {
 		return name
 	} else {
-		name := c.newDecodeStringFunc(directive)
-		c.decodeStringFuncName[directive] = name
+		name := c.createDecodeStringFunc(directives)
+		c.decodeStringFuncName[key] = name
 
 		return name
 	}
+}
+
+func directiveStatementToString(directives []*ast.DirectiveStatement) []string {
+	result := make([]string, len(directives))
+
+	for i, d := range directives {
+		result[i] = d.Name
+	}
+
+	return result
 }
 
 func (c *Obfuscator) hideValue(val interface{}, complexity int) ast.Statement {
@@ -484,7 +499,7 @@ func (c *Obfuscator) obfuscateString(str string, key int32) string {
 	return string(dst)
 }
 
-func (c *Obfuscator) newDecodeStringFunc(directive string) string {
+func (c *Obfuscator) createDecodeStringFunc(directives []*ast.DirectiveStatement) string {
 	strParam := c.randomString(10)
 	keyParam := c.randomString(10)
 	returnName := c.randomString(10)
@@ -610,7 +625,9 @@ func (c *Obfuscator) newDecodeStringFunc(directive string) string {
 			{Name: strParam},
 			{Name: keyParam},
 		},
-		Directive: directive,
+		Directives: lo.Filter(directives, func(item *ast.DirectiveStatement, index int) bool {
+			return item.Src == ""
+		}),
 	}
 
 	c.appendGarbage(&f.Body)
