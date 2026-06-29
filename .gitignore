@@ -21,3 +21,5 @@
 # Go workspace file
 go.work
 out_data
+/1c-obfuscator.exe
+/mcp-server.log

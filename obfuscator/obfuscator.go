@@ -43,6 +43,9 @@ type Config struct {
 
 	// LineBreaks false - результат будет в одну строку
 	LineBreaks bool
+
+	// NoEvalFuncs список функций, в которых не применяется RepExpByEval
+	NoEvalFuncs []string
 }
 
 type Obfuscator struct {
@@ -52,6 +55,7 @@ type Obfuscator struct {
 	trueCondition        chan string
 	falseCondition       chan string
 	decodeStringFuncName map[string]string
+	processed            map[*ast.Statement]bool
 }
 
 func init() {
@@ -65,6 +69,7 @@ func NewObfuscatory(ctx context.Context, conf Config) *Obfuscator {
 		trueCondition:        make(chan string, 10),
 		falseCondition:       make(chan string, 10),
 		decodeStringFuncName: make(map[string]string),
+		processed:            make(map[*ast.Statement]bool),
 	}
 
 	c.genCondition()
@@ -93,9 +98,59 @@ func (c *Obfuscator) Obfuscate(code string) (string, error) {
 		c.walkStep(root, parentStm, stm)
 	})
 
+	if c.conf.RepExpByEval {
+		helperCode := `Функция _ТранзакцияАктивна()
+	Возврат Истина;
+КонецФункции`
+		helperAST := ast.NewAST(helperCode)
+		if err := helperAST.Parse(); err == nil && len(helperAST.ModuleStatement.Body) > 0 {
+			helperFunc := helperAST.ModuleStatement.Body[0]
+			c.a.ModuleStatement.Body = append(ast.Statements{helperFunc}, c.a.ModuleStatement.Body...)
+		}
+	}
+
+	// страховка: гарантируем, что каждая метка Перейти предшествует оператору
+	// (метки встречаются только внутри процедур/функций, поэтому обходим их тела)
+	for i := range c.a.ModuleStatement.Body {
+		if fp, ok := c.a.ModuleStatement.Body[i].(*ast.FunctionOrProcedure); ok {
+			c.ensureLabelFollowedByStatement(&fp.Body)
+		}
+	}
+
 	result := c.a.Print(ast.PrintConf{OneLine: !c.conf.LineBreaks, Margin: 1})
+
+	if c.conf.RepExpByEval {
+		idx := strings.Index(result, "Функция _ТранзакцияАктивна()")
+		if idx != -1 {
+			endIdx := strings.Index(result[idx:], "КонецФункции")
+			if endIdx != -1 {
+				target := result[idx : idx+endIdx+len("КонецФункции")]
+				replacement := "Функция _ТранзакцияАктивна()\n" +
+					"#Если Сервер Или ТолстыйКлиентОбычноеПриложение Тогда\n" +
+					"\tВозврат ТранзакцияАктивна();\n" +
+					"#Иначе\n" +
+					"\tВозврат Истина;\n" +
+					"#КонецЕсли\n" +
+					"КонецФункции"
+				result = strings.Replace(result, target, replacement, 1)
+			}
+		}
+	}
+
 	// result = strings.ToLower(result) // нельзя так делать, все поломает
 	return result, nil
+}
+
+func (c *Obfuscator) shouldSkipEval(currentFP *ast.FunctionOrProcedure) bool {
+	if currentFP == nil {
+		return false
+	}
+	for _, name := range c.conf.NoEvalFuncs {
+		if strings.EqualFold(currentFP.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *ast.Statement) {
@@ -103,6 +158,11 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 		fmt.Println("! you can obfuscate a procedure or function")
 		return
 	}
+
+	if c.processed[item] {
+		return
+	}
+	c.processed[item] = true
 
 	key := float64(random(10, 100))
 
@@ -146,15 +206,24 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 
 		if c.conf.RepExpByEval && parent == nil {
 			str := c.a.PrintStatementWithConf(v, ast.PrintConf{})
-			if str[len(str)-1] == ';' {
-				str = str[:len(str)-1]
-			}
+			str = strings.TrimSpace(str)
+			str = strings.TrimSuffix(str, ";")
+			str = strings.TrimSpace(str)
 
-			*item = ast.MethodStatement{
+			evalStmt := ast.MethodStatement{
 				Name: "Выполнить",
 				Param: ast.ExprStatements{
 					Statements: ast.Statements{c.createObfuscateStringStatement(currentFP.Directives, str, int32(key))},
 				},
+			}
+
+			*item = &ast.IfStatement{
+				Expression: ast.MethodStatement{
+					Name:  "_ТранзакцияАктивна",
+					Param: ast.ExprStatements{},
+				},
+				TrueBlock:  ast.Statements{v},
+				ElseBlock:  ast.Statements{evalStmt},
 			}
 		}
 	case *ast.ReturnStatement:
@@ -165,19 +234,28 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 		c.obfuscateExpStatement(currentFP, (*interface{})(item))
 
 		if _, ok := v.Left.(ast.VarStatement); ok && c.conf.RepExpByEval {
-			switch v.Right.(type) {
+			switch rightVal := v.Right.(type) {
 			case ast.MethodStatement, ast.CallChainStatement, ast.NewObjectStatement:
 				str := c.a.PrintStatementWithConf(v.Right, ast.PrintConf{})
-				if str[len(str)-1] == ';' {
-					str = str[:len(str)-1]
-				}
+				str = strings.TrimSpace(str)
+				str = strings.TrimSuffix(str, ";")
+				str = strings.TrimSpace(str)
 
-				v.Right = ast.MethodStatement{
+				evalRight := ast.MethodStatement{
 					Name: "Вычислить",
 					Param: ast.ExprStatements{Statements: ast.Statements{ast.MethodStatement{
 						Name:  c.decodeStringFunc(currentFP.Directives),
 						Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, int32(key)), c.hideValue(key, 4)}},
 					}}},
+				}
+
+				v.Right = ast.TernaryStatement{
+					Expression: ast.MethodStatement{
+						Name:  "_ТранзакцияАктивна",
+						Param: ast.ExprStatements{},
+					},
+					TrueBlock:  rightVal,
+					ElseBlock:  evalRight,
 				}
 			default:
 				v.Right = c.hideValue(v.Right, 4)
@@ -186,18 +264,46 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 	case ast.CallChainStatement:
 		if c.conf.RepExpByEval && (c.isMethod(parent) || c.isExp(parent) || c.isFP(parent)) {
 			str := c.a.PrintStatementWithConf(v, ast.PrintConf{})
-			if str[len(str)-1] == ';' {
-				str = str[:len(str)-1]
-			}
+			str = strings.TrimSpace(str)
+			str = strings.TrimSuffix(str, ";")
+			str = strings.TrimSpace(str)
 
-			*item = ast.MethodStatement{
-				Name: ast.IF(c.isMethod(parent) || c.isExp(parent), "Вычислить", "Выполнить"),
-				Param: ast.ExprStatements{Statements: ast.Statements{
-					ast.MethodStatement{
-						Name:  c.decodeStringFunc(currentFP.Directives),
-						Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, int32(key)), c.hideValue(key, 4)}},
+			if c.isMethod(parent) || c.isExp(parent) {
+				evalStmt := ast.MethodStatement{
+					Name: "Вычислить",
+					Param: ast.ExprStatements{Statements: ast.Statements{
+						ast.MethodStatement{
+							Name:  c.decodeStringFunc(currentFP.Directives),
+							Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, int32(key)), c.hideValue(key, 4)}},
+						},
+					}},
+				}
+				*item = ast.TernaryStatement{
+					Expression: ast.MethodStatement{
+						Name:  "_ТранзакцияАктивна",
+						Param: ast.ExprStatements{},
 					},
-				}},
+					TrueBlock:  v,
+					ElseBlock:  evalStmt,
+				}
+			} else {
+				evalStmt := ast.MethodStatement{
+					Name: "Выполнить",
+					Param: ast.ExprStatements{Statements: ast.Statements{
+						ast.MethodStatement{
+							Name:  c.decodeStringFunc(currentFP.Directives),
+							Param: ast.ExprStatements{Statements: ast.Statements{c.obfuscateString(str, int32(key)), c.hideValue(key, 4)}},
+						},
+					}},
+				}
+				*item = &ast.IfStatement{
+					Expression: ast.MethodStatement{
+						Name:  "_ТранзакцияАктивна",
+						Param: ast.ExprStatements{},
+					},
+					TrueBlock:  ast.Statements{v},
+					ElseBlock:  ast.Statements{evalStmt},
+				}
 			}
 		}
 	case *ast.LoopStatement:
@@ -300,6 +406,67 @@ func (c *Obfuscator) hideValue(val interface{}, complexity int) ast.Statement {
 		return c.newTernary(val, int(random(2, complexity)), int(random(0, complexity-1)))
 	default:
 		return val
+	}
+}
+
+// no-op оператор, который вставляется после «висячих» меток,
+// чтобы каждая метка имела следующий за ней оператор (требование BSL).
+// Рендерится как "<rndvar> = 0;". После метки: "~x: <rndvar> = 0;".
+func (c *Obfuscator) noopStatement() ast.Statement {
+	return &ast.ExpStatement{
+		Operation: ast.OpEq,
+		Left:      ast.VarStatement{Name: c.randomString(10)},
+		Right:     float64(0),
+	}
+}
+
+// ensureLabelFollowedByStatement гарантирует, что ни одна метка
+// (*ast.GoToLabelStatement) не является последним оператором в теле и
+// не следует непосредственно перед другой меткой. В BSL метка обязана
+// предшествовать оператору, иначе возникает ошибка компиляции
+// («Обнаружено логическое завершение исходного текста модуля»).
+// Вызывается после всех трансформаций (перед Print), поэтому no-op'ы
+// не переобфусцируются и не меняют семантику.
+func (c *Obfuscator) ensureLabelFollowedByStatement(stmts *ast.Statements) {
+	// 1) вставляем no-op после «висячих»/смежных меток (собираем новый срез — индексы не плывут)
+	fixed := make(ast.Statements, 0, len(*stmts)*2)
+	for i := 0; i < len(*stmts); i++ {
+		fixed = append(fixed, (*stmts)[i])
+		if _, isLabel := (*stmts)[i].(*ast.GoToLabelStatement); isLabel {
+			needNoop := true
+			if i+1 < len(*stmts) {
+				if _, ok := (*stmts)[i+1].(*ast.GoToLabelStatement); !ok {
+					needNoop = false // за меткой идёт реальный оператор
+				}
+			}
+			if needNoop {
+				fixed = append(fixed, c.noopStatement())
+			}
+		}
+	}
+	*stmts = fixed
+
+	// 2) спускаемся во вложенные тела-контейнеры AST
+	for i := range *stmts {
+		switch v := (*stmts)[i].(type) {
+		case *ast.FunctionOrProcedure:
+			c.ensureLabelFollowedByStatement(&v.Body)
+		case *ast.IfStatement:
+			c.ensureLabelFollowedByStatement(&v.TrueBlock)
+			c.ensureLabelFollowedByStatement(&v.IfElseBlock)
+			c.ensureLabelFollowedByStatement(&v.ElseBlock)
+		case *ast.LoopStatement:
+			c.ensureLabelFollowedByStatement(&v.Body)
+		case ast.TryStatement:
+			// TryStatement хранится значением (а не указателем), поэтому
+			// правки по копии нужно записать обратно в срез.
+			c.ensureLabelFollowedByStatement(&v.Body)
+			c.ensureLabelFollowedByStatement(&v.Catch)
+			(*stmts)[i] = v
+		case ast.ExprStatements:
+			c.ensureLabelFollowedByStatement(&v.Statements)
+			(*stmts)[i] = v
+		}
 	}
 }
 
@@ -725,6 +892,28 @@ func (c *Obfuscator) convStrExpToExpStatement(str string) *ast.ExpStatement {
 	return astObj.ModuleStatement.Body[0].(*ast.ExpStatement)
 }
 
+func (c *Obfuscator) replaceBreakContinue(stmts *ast.Statements, startLabel, endLabel *ast.GoToLabelStatement) {
+	for i := range *stmts {
+		if (*stmts)[i] == nil {
+			continue
+		}
+		switch v := (*stmts)[i].(type) {
+		case ast.ContinueStatement:
+			(*stmts)[i] = ast.GoToStatement{Label: startLabel}
+		case ast.BreakStatement:
+			(*stmts)[i] = ast.GoToStatement{Label: endLabel}
+		case *ast.IfStatement:
+			c.replaceBreakContinue(&v.TrueBlock, startLabel, endLabel)
+			c.replaceBreakContinue(&v.ElseBlock, startLabel, endLabel)
+			c.replaceBreakContinue(&v.IfElseBlock, startLabel, endLabel)
+		case ast.ExprStatements:
+			c.replaceBreakContinue(&v.Statements, startLabel, endLabel)
+		case *ast.LoopStatement:
+			// Не заходим внутрь вложенных циклов
+		}
+	}
+}
+
 func (c *Obfuscator) loopToGoto(loop *ast.LoopStatement) ast.Statements {
 	start := &ast.GoToLabelStatement{Name: c.randomString(5)}
 	end := &ast.GoToLabelStatement{Name: c.randomString(5)}
@@ -739,15 +928,7 @@ func (c *Obfuscator) loopToGoto(loop *ast.LoopStatement) ast.Statements {
 			},
 		}
 
-		// меняем прервать и продолжить
-		ast.StatementWalk(loop, loop.Body, func(root *ast.FunctionOrProcedure, parentStm, stm *ast.Statement) {
-			switch (*stm).(type) {
-			case ast.ContinueStatement:
-				*stm = ast.GoToStatement{Label: start}
-			case ast.BreakStatement:
-				*stm = ast.GoToStatement{Label: end}
-			}
-		})
+		c.replaceBreakContinue(&loop.Body, start, end)
 
 		newBody = append(append(newBody, loop.Body...), ast.GoToStatement{Label: start}, end)
 		return newBody
@@ -759,6 +940,8 @@ func (c *Obfuscator) loopToGoto(loop *ast.LoopStatement) ast.Statements {
 		if !ok {
 			return ast.Statements{loop}
 		}
+
+		continueLabel := &ast.GoToLabelStatement{Name: c.randomString(5)}
 
 		newBody := ast.Statements{
 			exp,
@@ -773,7 +956,10 @@ func (c *Obfuscator) loopToGoto(loop *ast.LoopStatement) ast.Statements {
 			},
 		}
 
+		c.replaceBreakContinue(&loop.Body, continueLabel, end)
+
 		newBody = append(append(newBody, loop.Body...),
+			continueLabel,
 			&ast.ExpStatement{
 				Operation: ast.OpEq,
 				Left:      exp.Left,

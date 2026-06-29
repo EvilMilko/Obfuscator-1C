@@ -1,0 +1,10 @@
+{
+  "RepExpByTernary": true,
+  "RepLoopByGoto": true,
+  "RepExpByEval": true,
+  "HideString": true,
+  "ChangeConditions": true,
+  "AppendGarbage": true,
+  "CallStackHell": true,
+  "LineBreaks": false
+}
