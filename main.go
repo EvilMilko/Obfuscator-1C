@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -10,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/EvilMilko/Obfuscator-1C/obfuscator"
+	"golang.org/x/text/encoding/charmap"
 )
 
 // AppConfig зеркалирует параметры оригинальной библиотеки obfuscator.Config
@@ -111,6 +114,22 @@ func processBslFile(src, dst string, config obfuscator.Config, successObfuscated
 		return nil
 	}
 
+	// Проверка кодировки: если невалидный UTF-8, пробуем декодировать из Windows-1251
+	isWindows1251 := false
+	var textContent string
+	if !hasBOM && !utf8.Valid(content) {
+		decoder := charmap.Windows1251.NewDecoder()
+		decoded, err := decoder.Bytes(content)
+		if err == nil && utf8.Valid(decoded) {
+			textContent = string(decoded)
+			isWindows1251 = true
+		} else {
+			textContent = string(bytes.ToValidUTF8(content, []byte{}))
+		}
+	} else {
+		textContent = string(content)
+	}
+
 	var obfuscatedCode string
 	var obfErr error
 	var panicked bool
@@ -125,7 +144,7 @@ func processBslFile(src, dst string, config obfuscator.Config, successObfuscated
 		}()
 
 		obf := obfuscator.NewObfuscatory(context.Background(), config)
-		obfuscatedCode, obfErr = obf.Obfuscate(string(content))
+		obfuscatedCode, obfErr = obf.Obfuscate(textContent)
 	}()
 
 	if panicked || obfErr != nil {
@@ -140,9 +159,17 @@ func processBslFile(src, dst string, config obfuscator.Config, successObfuscated
 		return nil
 	}
 
-	// Сборка итогового содержимого
+	// Сборка итогового содержимого с сохранением исходной кодировки
 	var finalData []byte
-	if hasBOM {
+	if isWindows1251 {
+		encoder := charmap.Windows1251.NewEncoder()
+		encoded, err := encoder.Bytes([]byte(obfuscatedCode))
+		if err == nil {
+			finalData = encoded
+		} else {
+			finalData = []byte(obfuscatedCode)
+		}
+	} else if hasBOM {
 		finalData = append([]byte{0xef, 0xbb, 0xbf}, []byte(obfuscatedCode)...)
 	} else {
 		finalData = []byte(obfuscatedCode)

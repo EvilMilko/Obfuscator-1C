@@ -9,6 +9,9 @@ func (c *Obfuscator) hideBehindCallStack(directives []*ast.DirectiveStatement, v
 	if len(val.Statements) == 0 || len(val.Statements) > 1 {
 		return
 	}
+	if deep > 2 {
+		deep = 2
+	}
 
 	switch val.Statements[0].(type) {
 	case string, int, int32, int64, float32, float64, time.Time, bool:

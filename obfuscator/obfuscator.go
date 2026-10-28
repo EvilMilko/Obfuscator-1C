@@ -56,6 +56,7 @@ type Obfuscator struct {
 	falseCondition       chan string
 	decodeStringFuncName map[string]string
 	processed            map[*ast.Statement]bool
+	usedTransactionCheck bool
 }
 
 func init() {
@@ -98,8 +99,9 @@ func (c *Obfuscator) Obfuscate(code string) (string, error) {
 		c.walkStep(root, parentStm, stm)
 	})
 
-	if c.conf.RepExpByEval {
-		helperCode := `Функция _ТранзакцияАктивна()
+	if c.conf.RepExpByEval && c.usedTransactionCheck {
+		helperCode := `&НаКлиентеНаСервереБезКонтекста
+Функция _ТранзакцияАктивна()
 	Возврат Истина;
 КонецФункции`
 		helperAST := ast.NewAST(helperCode)
@@ -119,7 +121,7 @@ func (c *Obfuscator) Obfuscate(code string) (string, error) {
 
 	result := c.a.Print(ast.PrintConf{OneLine: !c.conf.LineBreaks, Margin: 1})
 
-	if c.conf.RepExpByEval {
+	if c.conf.RepExpByEval && c.usedTransactionCheck {
 		idx := strings.Index(result, "Функция _ТранзакцияАктивна()")
 		if idx != -1 {
 			endIdx := strings.Index(result[idx:], "КонецФункции")
@@ -131,7 +133,7 @@ func (c *Obfuscator) Obfuscate(code string) (string, error) {
 					"#Иначе\n" +
 					"\tВозврат Истина;\n" +
 					"#КонецЕсли\n" +
-					"КонецФункции"
+					"КонецФункции\n"
 				result = strings.Replace(result, target, replacement, 1)
 			}
 		}
@@ -204,7 +206,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 			}
 		}
 
-		if c.conf.RepExpByEval && parent == nil {
+		if c.conf.RepExpByEval && parent == nil && !c.shouldSkipEval(currentFP) {
 			str := c.a.PrintStatementWithConf(v, ast.PrintConf{})
 			str = strings.TrimSpace(str)
 			str = strings.TrimSuffix(str, ";")
@@ -217,6 +219,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 				},
 			}
 
+			c.usedTransactionCheck = true
 			*item = &ast.IfStatement{
 				Expression: ast.MethodStatement{
 					Name:  "_ТранзакцияАктивна",
@@ -233,7 +236,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 	case *ast.ExpStatement:
 		c.obfuscateExpStatement(currentFP, (*interface{})(item))
 
-		if _, ok := v.Left.(ast.VarStatement); ok && c.conf.RepExpByEval {
+		if _, ok := v.Left.(ast.VarStatement); ok && c.conf.RepExpByEval && !c.shouldSkipEval(currentFP) {
 			switch rightVal := v.Right.(type) {
 			case ast.MethodStatement, ast.CallChainStatement, ast.NewObjectStatement:
 				str := c.a.PrintStatementWithConf(v.Right, ast.PrintConf{})
@@ -249,6 +252,7 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 					}}},
 				}
 
+				c.usedTransactionCheck = true
 				v.Right = ast.TernaryStatement{
 					Expression: ast.MethodStatement{
 						Name:  "_ТранзакцияАктивна",
@@ -262,12 +266,13 @@ func (c *Obfuscator) walkStep(currentFP *ast.FunctionOrProcedure, parent, item *
 			}
 		}
 	case ast.CallChainStatement:
-		if c.conf.RepExpByEval && (c.isMethod(parent) || c.isExp(parent) || c.isFP(parent)) {
+		if c.conf.RepExpByEval && !c.shouldSkipEval(currentFP) && (c.isMethod(parent) || c.isExp(parent) || c.isFP(parent)) {
 			str := c.a.PrintStatementWithConf(v, ast.PrintConf{})
 			str = strings.TrimSpace(str)
 			str = strings.TrimSuffix(str, ";")
 			str = strings.TrimSpace(str)
 
+			c.usedTransactionCheck = true
 			if c.isMethod(parent) || c.isExp(parent) {
 				evalStmt := ast.MethodStatement{
 					Name: "Вычислить",
@@ -401,9 +406,12 @@ func directiveStatementToString(directives []*ast.DirectiveStatement) []string {
 }
 
 func (c *Obfuscator) hideValue(val interface{}, complexity int) ast.Statement {
+	if complexity > 3 {
+		complexity = 3
+	}
 	switch val.(type) {
 	case string, bool, float64, int, int32, int64, float32, time.Time, *ast.ExpStatement, ast.MethodStatement, ast.VarStatement:
-		return c.newTernary(val, int(random(2, complexity)), int(random(0, complexity-1)))
+		return c.newTernary(val, int(random(2, complexity+1)), int(random(0, complexity)))
 	default:
 		return val
 	}
@@ -590,13 +598,34 @@ func (c *Obfuscator) fakeValue(value interface{}) interface{} {
 	case *ast.ExpStatement:
 		return c.convStrExpToExpStatement(<-c.falseCondition)
 	case ast.MethodStatement:
-		return c.fakeMethods()
+		val := value.(ast.MethodStatement)
+		isNum := val.Name == "ПобитовоеИли" || val.Name == "ПобитовоеИНе" || val.Name == "ПобитовоеИ" || val.Name == "ПобитовыйСдвигВлево" || val.Name == "ПобитовыйСдвигВправо"
+		return c.fakeMethods(isNum)
 	default:
 		return value
 	}
 }
 
-func (c *Obfuscator) fakeMethods() ast.MethodStatement {
+func (c *Obfuscator) fakeMethods(isNumber ...bool) ast.MethodStatement {
+	numPool := []ast.MethodStatement{
+		{
+			Name:  "ПобитовыйСдвигВлево",
+			Param: ast.ExprStatements{Statements: ast.Statements{float64(random(0, 1000)), float64(random(1, 10))}},
+		},
+		{
+			Name:  "ПобитовыйСдвигВправо",
+			Param: ast.ExprStatements{Statements: ast.Statements{float64(random(0, 1000)), float64(random(1, 10))}},
+		},
+		{
+			Name:  "ПобитовоеИ",
+			Param: ast.ExprStatements{Statements: ast.Statements{float64(random(0, 1000)), float64(random(1, 10))}},
+		},
+	}
+
+	if len(isNumber) > 0 && isNumber[0] {
+		return numPool[random(0, len(numPool))]
+	}
+
 	// массив платформенных методов (важно что б они были доступны на клиенте и на сервере)
 	pool := []ast.MethodStatement{
 		{
@@ -615,19 +644,8 @@ func (c *Obfuscator) fakeMethods() ast.MethodStatement {
 			Name:  "Сред",
 			Param: ast.ExprStatements{Statements: ast.Statements{c.randomString(20), float64(random(1, 10)), float64(random(0, 10))}},
 		},
-		{
-			Name:  "ПобитовыйСдвигВлево",
-			Param: ast.ExprStatements{Statements: ast.Statements{float64(random(0, 1000)), float64(random(1, 10))}},
-		},
-		{
-			Name:  "ПобитовыйСдвигВправо",
-			Param: ast.ExprStatements{Statements: ast.Statements{float64(random(0, 1000)), float64(random(1, 10))}},
-		},
-		{
-			Name:  "ПобитовоеИ",
-			Param: ast.ExprStatements{Statements: ast.Statements{float64(random(0, 1000)), float64(random(1, 10))}},
-		},
 	}
+	pool = append(pool, numPool...)
 
 	return pool[random(0, len(pool))]
 }
@@ -646,7 +664,7 @@ func (c *Obfuscator) randomString(lenStr int) (result string) {
 func (c *Obfuscator) obfuscateString(str string, key int32) string {
 	var decrypted []rune
 
-	// если | первый в строке 1С его заменит на перенос строк, убераем такой
+	// если | первый в строке 1С его заменит на перенос строк, убираем такой
 	lines := strings.Split(str, "\n")
 	for i, line := range lines {
 		trimmed := strings.TrimLeft(line, " \t")
@@ -655,6 +673,8 @@ func (c *Obfuscator) obfuscateString(str string, key int32) string {
 		}
 	}
 	str = strings.Join(lines, "\n")
+	// нормализуем экранированные кавычки из AST парсера 1C ("" -> ")
+	str = strings.ReplaceAll(str, "\"\"", "\"")
 
 	for _, c := range str {
 		decrypted = append(decrypted, c^key)
